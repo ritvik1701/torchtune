@@ -14,14 +14,17 @@
 # This config works only for training on single device.
 
 output_dir: /tmp/torchtune/qwen2_5_0_5B/lora_single_device # /tmp may be deleted by your system. Change it to your preference.
+precompute_ref_log_probs: True
+batch_size: 8
 
 # Model arguments
 model:
   _component_: torchtune.models.qwen2_5.lora_qwen2_5_0_5b
-  lora_attn_modules: ['q_proj', 'v_proj', 'output_proj']
+  lora_attn_modules: ["q_proj", "v_proj", "output_proj"]
   apply_lora_to_mlp: True
-  lora_rank: 32  # higher increases accuracy and memory
-  lora_alpha: 64  # usually alpha=2*rank
+  apply_lora_to_output: False
+  lora_rank: 32 # higher increases accuracy and memory
+  lora_alpha: 64 # usually alpha=2*rank
   lora_dropout: 0.0
 
 # Tokenizer
@@ -43,8 +46,14 @@ resume_from_checkpoint: False
 
 # Dataset
 dataset:
-  _component_: torchtune.datasets.alpaca_cleaned_dataset
-  packed: False  # True increases speed
+  _component_: torchtune.datasets.preference_dataset
+  packed: False # True increases speed
+  source: json
+  data_files: /content/DPO-dataset-train.jsonl # /content/ for colab
+  column_map:
+    chosen: chosen
+    rejected: rejected
+  split: train
 seed: null
 shuffle: True
 
@@ -52,7 +61,7 @@ shuffle: True
 epochs: 1
 max_steps_per_epoch: null
 batch_size: 2
-gradient_accumulation_steps: 8  # Use to increase effective batch size
+gradient_accumulation_steps: 8 # Use to increase effective batch size
 optimizer:
   _component_: torch.optim.AdamW
   fused: True
@@ -68,10 +77,10 @@ loss:
 device: cuda
 
 # Memory management / performance
-enable_activation_checkpointing: False  # True reduces memory
-enable_activation_offloading: False  # True reduces memory
+enable_activation_checkpointing: False # True reduces memory
+enable_activation_offloading: False # True reduces memory
 dtype: bf16
-compile: False  # torch.compile the model + loss, True increases speed + decreases memory
+compile: False # torch.compile the model + loss, True increases speed + decreases memory
 
 # Logging
 metric_logger:
@@ -79,7 +88,6 @@ metric_logger:
   log_dir: ${output_dir}/logs
 log_every_n_steps: 1
 log_peak_memory_stats: True
-
 
 # Profiler (disabled)
 profiler:
