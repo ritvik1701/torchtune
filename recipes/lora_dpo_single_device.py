@@ -602,7 +602,8 @@ class LoRADPORecipeSingleDevice(FTRecipeInterface):
             # in case shuffle is True
             self._sampler.set_epoch(curr_epoch)
             pbar = tqdm(total=self._steps_per_epoch)
-            self._dataloader.dataset.clear_ref_log_probs()
+            if self._precompute_ref_log_probs:
+                self._dataloader.dataset.clear_ref_log_probs()
 
             for idx, batch in enumerate(self._dataloader):
                 if (
