@@ -586,6 +586,9 @@ class LoRADPORecipeSingleDevice(FTRecipeInterface):
         """
         The core training loop.
         """
+        pytorch_total_params = sum(p.numel() for p in self._model.parameters())
+        pytorch_trainable_params = sum(p.numel() for p in self._model.parameters() if p.requires_grad)
+        print(f"{pytorch_total_params=}, {pytorch_trainable_params=}")
         if self._model_compile:
             log.info(
                 "NOTE: torch.compile is enabled and model is compiled in first forward. Expect a relatively slow first iteration."
