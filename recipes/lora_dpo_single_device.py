@@ -425,7 +425,7 @@ class LoRADPORecipeSingleDevice(FTRecipeInterface):
         else:
             ds = config.instantiate(cfg_dataset, tokenizer=self._tokenizer)
 
-        print(f'\nPrecompute configured as: {self._precompute_ref_log_probs}')
+        print(f'Precompute ref log probs configured as: {self._precompute_ref_log_probs}')
 
         if self._precompute_ref_log_probs:
             '''
