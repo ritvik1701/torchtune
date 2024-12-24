@@ -35,6 +35,43 @@ from tqdm import tqdm
 log = utils.get_logger("DEBUG")
 
 
+class PrecomputedDataset(torch.utils.data.Dataset):
+    '''
+    A custom dataset implementation which behaves similar to what
+    DPO expects, but maintains the cache of the current batch's
+    precomputed referecen model log probs. This helps the training
+    loop by avoiding multiple forward passes: one for policy and 
+    one for reference log probs.
+    '''
+    def __init__(self, base_dataset, reference_chosen_log_probs, reference_rejected_log_probs):
+        super().__init__()
+        length_check = len(base_dataset) == len(reference_chosen_log_probs) and len(base_dataset) == len(reference_rejected_log_probs)
+        assert length_check, f"Length mismatch between base dataset ({len(base_dataset)}) and extra columns ({len(reference_chosen_log_probs)}, {len(reference_rejected_log_probs)})"
+        self.base_dataset = base_dataset
+        self.reference_chosen_log_probs = reference_chosen_log_probs
+        self.reference_rejected_log_probs = reference_rejected_log_probs
+        self.cache_ref_chosen_log_prob = []
+        self.cache_ref_rejected_log_prob = []
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        data = self.base_dataset[idx]
+        ref_chosen_log_probs = self.reference_chosen_log_probs[idx]
+        ref_rejected_log_probs = self.reference_rejected_log_probs[idx]
+        self.cache_ref_chosen_log_prob.append(ref_chosen_log_probs)
+        self.cache_ref_rejected_log_prob.append(ref_rejected_log_probs)
+        return data
+    
+    def clear_ref_log_probs(self):
+        self.cache_ref_chosen_log_prob = []
+        self.cache_ref_rejected_log_prob = []
+
+    def get_ref_log_probs(self):
+        return torch.tensor(self.cache_ref_chosen_log_prob).float(), torch.tensor(self.cache_ref_rejected_log_prob).float()
+
+
 class LoRADPORecipeSingleDevice(FTRecipeInterface):
     """
     LoRA DPO recipe for dense transformer-based LLMs such as Llama2 for
@@ -136,6 +173,9 @@ class LoRADPORecipeSingleDevice(FTRecipeInterface):
         self._resume_from_checkpoint = cfg.resume_from_checkpoint
         self._save_adapter_weights_only = cfg.get("save_adapter_weights_only", False)
         self._gradient_accumulation_steps = cfg.gradient_accumulation_steps
+        self._precompute_ref_log_probs = cfg.get(
+            "precompute_ref_log_probs", False
+        )
 
     def load_checkpoint(self, cfg_checkpointer: DictConfig) -> Dict[str, Any]:
         """
@@ -374,6 +414,8 @@ class LoRADPORecipeSingleDevice(FTRecipeInterface):
         Map-style Datasets which fit into memory and an option for random shuffling.
         Samplers, iterable datasets, and streaming datasets are not supported.
         """
+
+        utils.log_rank_zero(log, "\nCUSTOM IMPLEMENTATION\n")
         if isinstance(cfg_dataset, ListConfig):
             datasets = [
                 config.instantiate(single_cfg_dataset, tokenizer=self._tokenizer)
@@ -382,6 +424,58 @@ class LoRADPORecipeSingleDevice(FTRecipeInterface):
             ds = ConcatDataset(datasets=datasets)
         else:
             ds = config.instantiate(cfg_dataset, tokenizer=self._tokenizer)
+
+        print(f'Precompute ref log probs configured as: {self._precompute_ref_log_probs}')
+
+        if self._precompute_ref_log_probs:
+            '''
+            We can pre-compute the reference log_probs for (chosen,rejected)_ids. 
+            This can then be added to the dataset as columns, and the training loop
+            can be modified to prevent calculating the ref log probs, improving
+            training time.
+
+            References: 
+                [1] Pre-compute: https://github.com/huggingface/trl/blob/v0.13.0/trl/trainer/dpo_trainer.py#L712
+                [2] Understanding existing implementation: Claude (https://claude.ai/)
+                [3] DataLoader behaviour: https://pytorch.org/docs/stable/data.html#module-torch.utils.data
+            '''
+
+            sampler = DistributedSampler(
+                ds, num_replicas=1, rank=0, shuffle=False, seed=0
+            )
+            
+            dataloader = DataLoader(
+                dataset=ds,
+                batch_size=batch_size,
+                sampler=sampler,
+                # dropping last avoids shape issues with compile + flex attention
+                # drop_last=True,
+                collate_fn=partial(
+                    padded_collate_dpo,
+                    padding_idx=self._tokenizer.pad_id,
+                    ignore_idx=CROSS_ENTROPY_IGNORE_IDX,
+                ),
+            )
+
+            all_reference_chosen_log_probs = []
+            all_reference_rejected_log_probs = []
+            
+            with torch.no_grad(), disable_adapter(self._model):
+                for batch in tqdm(dataloader, "Pre-compute reference log probs"): 
+                    (
+                        reference_chosen_log_probs,
+                        reference_rejected_log_probs,
+                        _,
+                        _,
+                    ) = self.concatenated_forward(self._model, batch)
+
+                    all_reference_chosen_log_probs.append(reference_chosen_log_probs.cpu())
+                    all_reference_rejected_log_probs.append(reference_rejected_log_probs.cpu())
+
+                all_reference_chosen_log_probs = torch.concat(all_reference_chosen_log_probs).float()
+                all_reference_rejected_log_probs = torch.concat(all_reference_rejected_log_probs).float()
+
+            ds = PrecomputedDataset(ds, all_reference_chosen_log_probs, all_reference_rejected_log_probs)
 
         sampler = DistributedSampler(
             ds,
@@ -492,6 +586,9 @@ class LoRADPORecipeSingleDevice(FTRecipeInterface):
         """
         The core training loop.
         """
+        pytorch_total_params = sum(p.numel() for p in self._model.parameters())
+        pytorch_trainable_params = sum(p.numel() for p in self._model.parameters() if p.requires_grad)
+        print(f"Model: {self._model} \nParams-> total:{pytorch_total_params=}, trainable:{pytorch_trainable_params=}")
         if self._model_compile:
             log.info(
                 "NOTE: torch.compile is enabled and model is compiled in first forward. Expect a relatively slow first iteration."
@@ -508,6 +605,9 @@ class LoRADPORecipeSingleDevice(FTRecipeInterface):
             # in case shuffle is True
             self._sampler.set_epoch(curr_epoch)
             pbar = tqdm(total=self._steps_per_epoch)
+            if self._precompute_ref_log_probs:
+                self._dataloader.dataset.clear_ref_log_probs()
+
             for idx, batch in enumerate(self._dataloader):
                 if (
                     self.max_steps_per_epoch is not None
@@ -531,13 +631,20 @@ class LoRADPORecipeSingleDevice(FTRecipeInterface):
                 # deleting logits here helps reduce (peak) memory usage - we only need them for metric logging
                 del policy_chosen_logits, policy_rejected_logits
 
-                with torch.no_grad(), disable_adapter(self._model):
-                    (
-                        reference_chosen_log_probs,
-                        reference_rejected_log_probs,
-                        _,
-                        _,
-                    ) = self.concatenated_forward(self._model, batch)
+                if self._precompute_ref_log_probs:
+                    reference_chosen_log_probs, reference_rejected_log_probs = self._dataloader.dataset.get_ref_log_probs()
+                    reference_chosen_log_probs = reference_chosen_log_probs.to(device=self._device)
+                    reference_rejected_log_probs = reference_rejected_log_probs.to(device=self._device)
+                    self._dataloader.dataset.clear_ref_log_probs()
+                else:
+                    with torch.no_grad(), disable_adapter(self._model):
+                        (
+                            reference_chosen_log_probs,
+                            reference_rejected_log_probs,
+                            _,
+                            _,
+                        ) = self.concatenated_forward(self._model, batch)
+
                 loss, chosen_rewards, rejected_rewards = self._loss_fn(
                     policy_chosen_log_probs,
                     policy_rejected_log_probs,
